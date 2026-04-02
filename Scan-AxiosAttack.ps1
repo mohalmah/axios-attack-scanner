@@ -160,54 +160,91 @@ function Invoke-LockfileScan {
           "C:\Program Files\nodejs")
     }
 
-    $locks = [System.Collections.Generic.List[string]]::new()
-    $i = 0
-    foreach ($root in $roots) {
-        if (-not (Test-Path $root)) { $i++; continue }
-        Write-ProgressBar "Indexing $root..." ([int](($i/$roots.Count)*30))
-        try {
-            Get-ChildItem -Path $root -Recurse -Depth 8 -File -ErrorAction SilentlyContinue `
-                -Include "package-lock.json","yarn.lock","pnpm-lock.yaml" |
-            Where-Object { $_.FullName -notmatch '\\node_modules\\node_modules\\' } |
-            ForEach-Object { $locks.Add($_.FullName) }
-        } catch {}
-        $i++
+    # Unique, existing roots only
+    $roots = $roots | Select-Object -Unique | Where-Object { Test-Path $_ }
+
+    $lockNames  = @("package-lock.json","yarn.lock","pnpm-lock.yaml")
+    $compromised = [System.Collections.Generic.List[string]]::new()
+    $scanned    = 0
+    $dirCount   = 0
+    $maxDepth   = 8
+
+    # Live status line helper
+    function Show-Status ([string]$Dir, [int]$DirN, [int]$Found, [int]$ScannedN) {
+        $short = $Dir -replace [regex]::Escape($env:USERPROFILE),"~"
+        if ($short.Length -gt 48) { $short = "..." + $short.Substring($short.Length - 45) }
+        $status = "dirs:$DirN  lockfiles found:$Found  scanned:$ScannedN"
+        Write-Host ("`r  Scanning: $($short.PadRight(50))  $status   ") -NoNewline -ForegroundColor DarkCyan
     }
-    Clear-Line
-    Write-Color "  Found $($locks.Count) lockfile(s)" DarkGray
+
+    foreach ($root in $roots) {
+        Write-Host ("`r  Root: $root" + (" " * 40)) -NoNewline -ForegroundColor Cyan
+        Write-Host ""
+
+        # BFS queue - each entry is [path, depth]
+        $queue = [System.Collections.Generic.Queue[object]]::new()
+        $queue.Enqueue(@($root, 0))
+
+        while ($queue.Count -gt 0) {
+            $entry    = $queue.Dequeue()
+            $dir      = $entry[0]
+            $depth    = $entry[1]
+            $dirCount++
+
+            Show-Status $dir $dirCount $compromised.Count $scanned
+
+            # Check for lockfiles in this directory
+            foreach ($name in $lockNames) {
+                $candidate = Join-Path $dir $name
+                if (Test-Path $candidate -PathType Leaf) {
+                    $scanned++
+                    $Script:ScannedCount++
+                    Show-Status $dir $dirCount $compromised.Count $scanned
+                    try {
+                        $c        = [System.IO.File]::ReadAllText($candidate)
+                        $hasAxios = $c -match 'axios@1\.14\.1|"axios":\s*"1\.14\.1"'
+                        $hasCrypt = $c -match 'plain-crypto-js'
+                        $hasOld04 = $c -match 'axios@0\.30\.4|"axios":\s*"0\.30\.4"'
+
+                        if ($hasAxios -or $hasCrypt -or $hasOld04) {
+                            $compromised.Add($candidate)
+                            Write-Host ""   # newline after status
+                            Write-Finding "CRITICAL" "COMPROMISED lockfile!" $candidate
+                            if ($hasAxios)  { Write-Color "             -> axios@1.14.1 present" Red }
+                            if ($hasOld04)  { Write-Color "             -> axios@0.30.4 present (also malicious!)" Red }
+                            if ($hasCrypt)  { Write-Color "             -> plain-crypto-js present (RAT dropper)" Red }
+                        }
+                    } catch {}
+                }
+            }
+
+            # Enqueue subdirectories (skip deep node_modules, system dirs)
+            if ($depth -ge $maxDepth) { continue }
+            try {
+                $subdirs = [System.IO.Directory]::GetDirectories($dir)
+                foreach ($sub in $subdirs) {
+                    $leaf = Split-Path $sub -Leaf
+                    # Skip noisy/large dirs that won't contain project lockfiles
+                    if ($leaf -in @('.git','__pycache__','.vs','bin','obj','dist',
+                                    'out','.cache','.parcel-cache','.next','coverage',
+                                    'AppData','$Recycle.Bin','Windows','System32',
+                                    'SysWOW64','WinSxS')) { continue }
+                    # Only descend into nested node_modules once
+                    if ($leaf -eq 'node_modules' -and $dir -match '\\node_modules') { continue }
+                    $queue.Enqueue(@($sub, $depth + 1))
+                }
+            } catch {}
+        }
+    }
+
+    # Clear the status line
+    Write-Host ("`r" + (" " * 90) + "`r") -NoNewline
+    Write-Color "  Directories walked : $dirCount" DarkGray
+    Write-Color "  Lockfiles scanned  : $scanned" DarkGray
     Write-Color ""
 
-    $compromised = [System.Collections.Generic.List[string]]::new()
-    $total = $locks.Count
-    $idx   = 0
-
-    foreach ($f in $locks) {
-        $idx++
-        $pct   = [int](30 + ($idx/[Math]::Max($total,1))*55)
-        $short = $f -replace [regex]::Escape($env:USERPROFILE),"~"
-        Write-ProgressBar $short $pct
-        $Script:ScannedCount++
-
-        try {
-            $c        = [System.IO.File]::ReadAllText($f)
-            $hasAxios = $c -match 'axios@1\.14\.1|"axios":\s*"1\.14\.1"'
-            $hasCrypt = $c -match 'plain-crypto-js'
-            $hasOld04 = $c -match 'axios@0\.30\.4|"axios":\s*"0\.30\.4"'   # second malicious version
-
-            if ($hasAxios -or $hasCrypt -or $hasOld04) {
-                $compromised.Add($f)
-                Clear-Line
-                Write-Finding "CRITICAL" "COMPROMISED lockfile!" $f
-                if ($hasAxios)  { Write-Color "             -> axios@1.14.1 found" Red }
-                if ($hasOld04)  { Write-Color "             -> axios@0.30.4 found (also malicious!)" Red }
-                if ($hasCrypt)  { Write-Color "             -> plain-crypto-js present (RAT dropper)" Red }
-            }
-        } catch {}
-    }
-    Clear-Line
-
     if ($compromised.Count -eq 0) {
-        Write-Finding "SAFE" "No compromised lockfiles ($total scanned)"
+        Write-Finding "SAFE" "No compromised lockfiles ($scanned scanned across $dirCount dirs)"
     } else {
         Write-Color ""
         Write-Color "  !! $($compromised.Count) COMPROMISED PROJECT(S) FOUND !!" Red
@@ -222,21 +259,53 @@ function Invoke-LockfileScan {
 function Invoke-NodeModulesScan {
     Write-Section "2. INSTALLED node_modules"
 
-    $roots   = @($ScanRoot,"C:\dev","C:\projects","C:\code","C:\repos")
+    $roots   = @($ScanRoot,"C:\dev","C:\projects","C:\code","C:\repos") |
+               Select-Object -Unique | Where-Object { Test-Path $_ }
     $results = [System.Collections.Generic.List[string]]::new()
+    $dirCount = 0
 
     foreach ($root in $roots) {
-        if (-not (Test-Path $root)) { continue }
-        try {
-            Get-ChildItem -Path $root -Recurse -Depth 10 -Directory `
-                -Filter "plain-crypto-js" -ErrorAction SilentlyContinue |
-            ForEach-Object { $results.Add($_.FullName) }
-        } catch {}
+        Write-Host ("`r  Root: $root" + (" " * 40)) -NoNewline -ForegroundColor Cyan
+        Write-Host ""
+
+        $queue = [System.Collections.Generic.Queue[object]]::new()
+        $queue.Enqueue(@($root, 0))
+
+        while ($queue.Count -gt 0) {
+            $entry = $queue.Dequeue()
+            $dir   = $entry[0]
+            $depth = $entry[1]
+            $dirCount++
+
+            $leaf = Split-Path $dir -Leaf
+
+            # Found it?
+            if ($leaf -eq "plain-crypto-js") {
+                $results.Add($dir)
+                Write-Host ""
+                Write-Finding "CRITICAL" "plain-crypto-js INSTALLED on disk!" $dir
+                continue   # no need to descend into it
+            }
+
+            if ($depth -ge 10) { continue }
+            try {
+                foreach ($sub in [System.IO.Directory]::GetDirectories($dir)) {
+                    $subLeaf = Split-Path $sub -Leaf
+                    if ($subLeaf -in @('.git','AppData','Windows','System32','SysWOW64','WinSxS','$Recycle.Bin')) { continue }
+                    $queue.Enqueue(@($sub, $depth + 1))
+                }
+            } catch {}
+
+            Write-Host ("`r  Scanning: $(($dir -replace [regex]::Escape($env:USERPROFILE),'~').PadRight(60))  dirs:$dirCount") `
+                -NoNewline -ForegroundColor DarkCyan
+        }
     }
 
-    if ($results.Count -gt 0) {
-        foreach ($d in $results) { Write-Finding "CRITICAL" "plain-crypto-js INSTALLED on disk!" $d }
-    } else {
+    Write-Host ("`r" + (" " * 90) + "`r") -NoNewline
+    Write-Color "  Directories walked : $dirCount" DarkGray
+    Write-Color ""
+
+    if ($results.Count -eq 0) {
         Write-Finding "SAFE" "plain-crypto-js not found in any node_modules"
     }
 }
